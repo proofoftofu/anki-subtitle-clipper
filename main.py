@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -141,8 +142,7 @@ def load_anki_config(path: Path):
         raise RuntimeError(f"Missing keys in Anki config: {', '.join(missing)}")
 
     data.setdefault("anki_connect_url", "http://127.0.0.1:8765")
-    data.setdefault("allow_duplicate", True)
-    data.setdefault("tags", [])
+    data.setdefault("allow_duplicate", False)
     return data
 
 
@@ -185,7 +185,6 @@ def add_note_to_anki(output_video: Path, back_text: str, config: dict):
         "deckName": config["deck_name"],
         "modelName": config["model_name"],
         "fields": fields,
-        "tags": config["tags"],
         "options": {"allowDuplicate": bool(config["allow_duplicate"])},
     }
     note_id = anki_connect_request(url, "addNote", {"note": note})
@@ -208,24 +207,10 @@ def main():
         help='Subtitle text to find, e.g. "hi, I met you..."',
     )
     parser.add_argument(
-        "output_dir",
-        help="Output directory path (absolute or relative).",
-    )
-    parser.add_argument(
         "--padding",
         type=float,
         default=0.0,
         help="Seconds to extend before start and after end (default: 0).",
-    )
-    parser.add_argument(
-        "--anki",
-        action="store_true",
-        help="Add generated clip to Anki (front=video, back=matched subtitle text).",
-    )
-    parser.add_argument(
-        "--anki-config",
-        default="anki_config.json",
-        help="Path to Anki config JSON (default: ./anki_config.json).",
     )
     args = parser.parse_args()
 
@@ -235,13 +220,6 @@ def main():
         sys.exit(1)
     work_dir = video_path.parent
     srt_path = work_dir / f"{video_path.stem}.srt"
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    if not output_dir.exists():
-        print(f"Error: output directory not found: {output_dir}", file=sys.stderr)
-        sys.exit(1)
-    if not output_dir.is_dir():
-        print(f"Error: output path is not a directory: {output_dir}", file=sys.stderr)
-        sys.exit(1)
 
     if not video_path.exists():
         print(f"Error: video file not found: {video_path}", file=sys.stderr)
@@ -283,28 +261,23 @@ def main():
     start_sec = max(match["start"] - pad, 0.0)
     end_sec = max(match["end"] + pad, start_sec + 0.1)
     range_text = collect_text_in_range(entries, start_sec, end_sec)
-    output_name = safe_filename_from_sub_text(range_text) + ".mp4"
-    output_path = output_dir / output_name
+    media_name = safe_filename_from_sub_text(range_text) + ".mp4"
+    config_path = Path(__file__).resolve().parent / "anki_config.json"
 
     try:
-        run_ffmpeg(video_path, output_path, start_sec, end_sec)
+        anki_config = load_anki_config(config_path)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / media_name
+            run_ffmpeg(video_path, output_path, start_sec, end_sec)
+            note_id = add_note_to_anki(output_path, match["text"], anki_config)
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Time range: {seconds_to_ffmpeg_time(start_sec)} -> {seconds_to_ffmpeg_time(end_sec)}")
-    print(f"Output: {output_path}")
+    print(f"Anki media: {media_name}")
     print(f"Matched subtitle: {match['text']}")
-
-    if args.anki:
-        config_path = Path(args.anki_config).expanduser().resolve()
-        try:
-            anki_config = load_anki_config(config_path)
-            note_id = add_note_to_anki(output_path, match["text"], anki_config)
-        except RuntimeError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            sys.exit(1)
-        print(f"Anki note created: {note_id}")
+    print(f"Anki note created: {note_id}")
 
 
 if __name__ == "__main__":

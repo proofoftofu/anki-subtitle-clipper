@@ -1,3 +1,0 @@
-# No external Python packages are required.
-# System dependency (must be installed separately):
-# ffmpeg
