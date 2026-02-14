@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import base64
+import json
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -123,6 +127,71 @@ def run_ffmpeg(input_video: Path, output_video: Path, start_sec: float, end_sec:
         raise RuntimeError(f"ffmpeg failed with exit code {exc.returncode}.")
 
 
+def load_anki_config(path: Path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise RuntimeError(f"Anki config file not found: {path}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON in Anki config: {exc}")
+
+    required = ["deck_name", "model_name", "front_field", "back_field"]
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise RuntimeError(f"Missing keys in Anki config: {', '.join(missing)}")
+
+    data.setdefault("anki_connect_url", "http://127.0.0.1:8765")
+    data.setdefault("allow_duplicate", True)
+    data.setdefault("tags", [])
+    return data
+
+
+def anki_connect_request(url: str, action: str, params: dict):
+    payload = json.dumps({"action": action, "version": 6, "params": params}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Cannot connect to AnkiConnect at {url}: {exc}")
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"Invalid AnkiConnect response: {raw}")
+
+    if data.get("error"):
+        raise RuntimeError(f"AnkiConnect error for '{action}': {data['error']}")
+    return data.get("result")
+
+
+def add_note_to_anki(output_video: Path, back_text: str, config: dict):
+    video_bytes = output_video.read_bytes()
+    media_name = output_video.name
+    media_b64 = base64.b64encode(video_bytes).decode("ascii")
+
+    url = config["anki_connect_url"]
+    anki_connect_request(
+        url,
+        "storeMediaFile",
+        {"filename": media_name, "data": media_b64},
+    )
+
+    fields = {
+        config["front_field"]: f"[sound:{media_name}]",
+        config["back_field"]: back_text,
+    }
+    note = {
+        "deckName": config["deck_name"],
+        "modelName": config["model_name"],
+        "fields": fields,
+        "tags": config["tags"],
+        "options": {"allowDuplicate": bool(config["allow_duplicate"])},
+    }
+    note_id = anki_connect_request(url, "addNote", {"note": note})
+    return note_id
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -147,6 +216,16 @@ def main():
         type=float,
         default=0.0,
         help="Seconds to extend before start and after end (default: 0).",
+    )
+    parser.add_argument(
+        "--anki",
+        action="store_true",
+        help="Add generated clip to Anki (front=video, back=matched subtitle text).",
+    )
+    parser.add_argument(
+        "--anki-config",
+        default="anki_config.json",
+        help="Path to Anki config JSON (default: ./anki_config.json).",
     )
     args = parser.parse_args()
 
@@ -216,6 +295,16 @@ def main():
     print(f"Time range: {seconds_to_ffmpeg_time(start_sec)} -> {seconds_to_ffmpeg_time(end_sec)}")
     print(f"Output: {output_path}")
     print(f"Matched subtitle: {match['text']}")
+
+    if args.anki:
+        config_path = Path(args.anki_config).expanduser().resolve()
+        try:
+            anki_config = load_anki_config(config_path)
+            note_id = add_note_to_anki(output_path, match["text"], anki_config)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Anki note created: {note_id}")
 
 
 if __name__ == "__main__":
