@@ -15,23 +15,15 @@ Back field:
 - Anki desktop app running
 - Anki add-on: AnkiConnect (`2055492159`)
 
-## Config
+## Config In Code
 
-Edit `anki_config.json` in this project folder:
+Edit constants in `main.py`:
 
-```json
-{
-  "anki_connect_url": "http://127.0.0.1:8765",
-  "deck_name": "Default",
-  "model_name": "Basic",
-  "front_field": "Front",
-  "back_field": "Back"
-}
-```
-
-Notes:
-- Duplicates are disallowed by default.
-- `anki_config.json` is loaded automatically from the same directory as `main.py`.
+- `ANKI_CONNECT_URL`
+- `ANKI_DECK_NAME`
+- `ANKI_MODEL_NAME`
+- `ANKI_FRONT_FIELD`
+- `ANKI_BACK_FIELD`
 
 ## Usage
 
@@ -51,4 +43,5 @@ python3 main.py "/absolute/path/video.mp4" "subtitle text to find" --padding 0.5
   - `/path/video.mp4`
   - `/path/video.srt`
 - If multiple subtitle lines match, it asks you to choose one.
+- It checks existing notes in the target deck using your search text. If matches exist, it asks `Y/n` (default `Y`) before adding.
 - Extracted clip is temporary (not kept on disk after adding to Anki).

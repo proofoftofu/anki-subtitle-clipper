@@ -14,6 +14,11 @@ from pathlib import Path
 SRT_TIMESTAMP_RE = re.compile(
     r"^\s*(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})"
 )
+ANKI_CONNECT_URL = "http://127.0.0.1:8765"
+ANKI_DECK_NAME = "Default"
+ANKI_MODEL_NAME = "Basic"
+ANKI_FRONT_FIELD = "Front"
+ANKI_BACK_FIELD = "Back"
 
 
 def normalize_text(text: str) -> str:
@@ -128,22 +133,8 @@ def run_ffmpeg(input_video: Path, output_video: Path, start_sec: float, end_sec:
         raise RuntimeError(f"ffmpeg failed with exit code {exc.returncode}.")
 
 
-def load_anki_config(path: Path):
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise RuntimeError(f"Anki config file not found: {path}")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid JSON in Anki config: {exc}")
-
-    required = ["deck_name", "model_name", "front_field", "back_field"]
-    missing = [key for key in required if key not in data]
-    if missing:
-        raise RuntimeError(f"Missing keys in Anki config: {', '.join(missing)}")
-
-    data.setdefault("anki_connect_url", "http://127.0.0.1:8765")
-    data.setdefault("allow_duplicate", False)
-    return data
+def escape_for_anki_query(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def anki_connect_request(url: str, action: str, params: dict):
@@ -165,30 +156,64 @@ def anki_connect_request(url: str, action: str, params: dict):
     return data.get("result")
 
 
-def add_note_to_anki(output_video: Path, back_text: str, config: dict):
+def add_note_to_anki(output_video: Path, back_text: str, anki_url: str, deck_name: str):
     video_bytes = output_video.read_bytes()
     media_name = output_video.name
     media_b64 = base64.b64encode(video_bytes).decode("ascii")
 
-    url = config["anki_connect_url"]
     anki_connect_request(
-        url,
+        anki_url,
         "storeMediaFile",
         {"filename": media_name, "data": media_b64},
     )
 
     fields = {
-        config["front_field"]: f"[sound:{media_name}]",
-        config["back_field"]: back_text,
+        ANKI_FRONT_FIELD: f"[sound:{media_name}]",
+        ANKI_BACK_FIELD: back_text,
     }
     note = {
-        "deckName": config["deck_name"],
-        "modelName": config["model_name"],
+        "deckName": deck_name,
+        "modelName": ANKI_MODEL_NAME,
         "fields": fields,
-        "options": {"allowDuplicate": bool(config["allow_duplicate"])},
+        "options": {"allowDuplicate": True},
     }
-    note_id = anki_connect_request(url, "addNote", {"note": note})
+    note_id = anki_connect_request(anki_url, "addNote", {"note": note})
     return note_id
+
+
+def find_existing_notes(url: str, deck_name: str, query_text: str):
+    deck_q = escape_for_anki_query(deck_name)
+    text_q = escape_for_anki_query(query_text)
+    anki_query = f'deck:"{deck_q}" "{text_q}"'
+    return anki_connect_request(url, "findNotes", {"query": anki_query})
+
+
+def fetch_note_previews(url: str, note_ids):
+    if not note_ids:
+        return []
+    infos = anki_connect_request(url, "notesInfo", {"notes": note_ids})
+    previews = []
+    for info in infos:
+        fields = info.get("fields", {})
+        back_val = fields.get(ANKI_BACK_FIELD, {}).get("value", "").strip()
+        front_val = fields.get(ANKI_FRONT_FIELD, {}).get("value", "").strip()
+        text = back_val or front_val
+        text = " ".join(text.split())
+        if len(text) > 120:
+            text = text[:117] + "..."
+        previews.append(text if text else "(empty)")
+    return previews
+
+
+def should_continue_with_existing(existing_count: int, previews) -> bool:
+    if existing_count <= 0:
+        return True
+    print(f"Found {existing_count} existing note(s) matching this text in the deck.")
+    print("Matched existing text:")
+    for idx, text in enumerate(previews, start=1):
+        print(f"{idx}. {text}")
+    raw = input("Continue and add new card? [Y/n]: ").strip().lower()
+    return raw in ("", "y", "yes")
 
 
 def main():
@@ -228,6 +253,16 @@ def main():
         print(f"Error: subtitle file not found: {srt_path}", file=sys.stderr)
         sys.exit(1)
 
+    try:
+        existing_ids = find_existing_notes(ANKI_CONNECT_URL, ANKI_DECK_NAME, args.sub)
+        existing_previews = fetch_note_previews(ANKI_CONNECT_URL, existing_ids)
+        if not should_continue_with_existing(len(existing_ids), existing_previews):
+            print("Skipped adding note.")
+            return
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     entries = parse_srt(srt_path)
     if not entries:
         print(f"Error: no subtitle entries found in {srt_path}", file=sys.stderr)
@@ -262,14 +297,17 @@ def main():
     end_sec = max(match["end"] + pad, start_sec + 0.1)
     range_text = collect_text_in_range(entries, start_sec, end_sec)
     media_name = safe_filename_from_sub_text(range_text) + ".mp4"
-    config_path = Path(__file__).resolve().parent / "anki_config.json"
 
     try:
-        anki_config = load_anki_config(config_path)
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / media_name
             run_ffmpeg(video_path, output_path, start_sec, end_sec)
-            note_id = add_note_to_anki(output_path, match["text"], anki_config)
+            note_id = add_note_to_anki(
+                output_path,
+                match["text"],
+                ANKI_CONNECT_URL,
+                ANKI_DECK_NAME,
+            )
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
